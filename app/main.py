@@ -46,9 +46,13 @@ def create_app() -> FastAPI:
         description=(
             "抓取两个本地 Prometheus 延迟直方图实例，每实例取最近两次抓取"
             "（均须在近 3 秒内、来自同一进程、间隔至少 1 秒），用桶计数增量"
-            "计算两实例合计达标比例的上下界并给出放量建议。"
+            "计算两实例合计达标比例的上下界并给出放量建议。\n\n"
+            "样例目标通过 /metrics_delta 支持增量抓取：首次抓取或进程重启时"
+            "取整表，其余成功响应只携带自上次成功接收以来有新增请求的互斥"
+            "延迟桶（含尾桶）；响应丢失或处理失败时保留上次成功基准，下次"
+            "成功抓取自动补齐。普通 Prometheus 目标（无该端点）沿用全量抓取。"
         ),
-        version="1.0.0",
+        version="1.1.0",
         lifespan=lifespan,
     )
     app.state.store = store
@@ -160,7 +164,14 @@ def create_app() -> FastAPI:
 
     @app.get("/stats", tags=["核查"])
     async def stats() -> dict:
-        """Actual scrape counts and the timestamps of samples in use."""
+        """Scrape counts, sample timestamps and incremental-traffic telemetry.
+
+        Per instance the payload includes ``full_table_body_bytes`` /
+        ``delta_body_bytes`` -- the cumulative response-body bytes received as
+        full tables versus incremental payloads -- alongside the response
+        counts, transport mode and the current delta session (run id, cursor
+        and reconstructed exclusive bucket counts).
+        """
         data = store.stats()
         now = time.time()
         data["checked_at"] = now

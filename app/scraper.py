@@ -4,6 +4,21 @@ A single background task scrapes every configured instance on a fixed
 cadence (>= 1s apart per instance).  All concurrent ``/check`` requests read
 from the same in-memory store, so checks share samples and one request
 timing out never disturbs another.
+
+Scrape transport per instance:
+
+* Targets implementing the JSON incremental protocol (the bundled sample
+  targets) are scraped via ``/metrics_delta``.  The first scrape of a process
+  (and every restart / unknown cursor) fetches a full table; later successful
+  scrapes only receive the mutually exclusive buckets that gained requests
+  since the scraper's last successful response.  The store merges those
+  deltas into a :class:`HistogramSnapshot` identical to a full-table scrape,
+  so all downstream selection and decision logic stays unchanged.
+* A lost response or a processing failure never advances the baseline: the
+  next successful scrape of the same process carries every missing count.
+  An empty delta is still a successful scrape.
+* Plain Prometheus targets that do not serve ``/metrics_delta`` (HTTP 404)
+  fall back to the classic text exposition and are always scraped in full.
 """
 
 from __future__ import annotations
@@ -13,9 +28,16 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from .delta import (
+    DeltaProtocolError,
+    DeltaSession,
+    apply_delta,
+    snapshot_from_full,
+)
 from .histogram import (
     HistogramDelta,
     HistogramSnapshot,
@@ -37,6 +59,23 @@ SCRAPE_INTERVAL = 1.05
 HISTORY_LIMIT = 8
 HTTP_TIMEOUT = 2.0
 
+# Transport labels used on records and in /stats.
+TRANSPORT_TEXT = "prometheus-text"
+TRANSPORT_FULL_JSON = "full-json"
+TRANSPORT_DELTA_JSON = "delta-json"
+
+
+def delta_url_for(metrics_url: str) -> str | None:
+    """Derive the JSON delta endpoint next to a ``/metrics`` URL."""
+    parsed = urlsplit(metrics_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+    base, _, _last = parsed.path.rpartition("/")
+    new_path = f"{base}/metrics_delta"
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, new_path, parsed.query, parsed.fragment)
+    )
+
 
 @dataclass
 class ScrapeRecord:
@@ -44,6 +83,8 @@ class ScrapeRecord:
     at: float
     snapshot: HistogramSnapshot | None = None
     error: str | None = None
+    transport: str | None = None
+    body_bytes: int = 0
 
 
 @dataclass
@@ -54,6 +95,15 @@ class InstanceState:
     total_attempts: int = 0
     total_successes: int = 0
     total_failures: int = 0
+    # Incremental-protocol state (None until the first successful JSON scrape).
+    session: DeltaSession | None = None
+    # None = capability unknown, True/False = probed / permanently text-only.
+    delta_capable: bool | None = None
+    # Cumulative response-body bytes actually received and processed, by kind.
+    full_body_bytes: int = 0
+    delta_body_bytes: int = 0
+    full_responses: int = 0
+    delta_responses: int = 0
 
     @property
     def latest(self) -> ScrapeRecord | None:
@@ -117,25 +167,109 @@ class ScrapeStore:
     async def _scrape_once(self, state: InstanceState) -> None:
         assert self._client is not None
         state.total_attempts += 1
+        record: ScrapeRecord
         try:
-            response = await self._client.get(state.url)
-            response.raise_for_status()
-            snapshot = parse_metrics_text(
-                response.text, self.metric_name, time.time()
-            )
-            record = ScrapeRecord(ok=True, at=snapshot.scraped_at, snapshot=snapshot)
+            snapshot, record = await self._fetch_snapshot(state)
             state.total_successes += 1
         except (httpx.HTTPError, MetricsParseError, ValueError) as exc:
-            record = ScrapeRecord(ok=False, at=time.time(), error=f"{type(exc).__name__}: {exc}")
+            # The baseline session is deliberately left untouched: a lost
+            # response or an unprocessable payload must not advance it, so the
+            # next successful scrape of the same process catches everything.
+            record = ScrapeRecord(
+                ok=False, at=time.time(), error=f"{type(exc).__name__}: {exc}"
+            )
             state.total_failures += 1
         except Exception as exc:  # defensive: one bad scrape must not kill the loop
             logger.exception("unexpected scrape failure for %s", state.name)
-            record = ScrapeRecord(ok=False, at=time.time(), error=f"{type(exc).__name__}: {exc}")
+            record = ScrapeRecord(
+                ok=False, at=time.time(), error=f"{type(exc).__name__}: {exc}"
+            )
             state.total_failures += 1
 
         state.history.append(record)
         if len(state.history) > HISTORY_LIMIT:
             del state.history[: len(state.history) - HISTORY_LIMIT]
+
+    async def _fetch_snapshot(
+        self, state: InstanceState
+    ) -> tuple[HistogramSnapshot, ScrapeRecord]:
+        """Fetch one snapshot, using the delta protocol when supported."""
+        delta_url = delta_url_for(state.url)
+        if state.delta_capable is not False and delta_url is not None:
+            snapshot, record = await self._fetch_json_delta(state, delta_url)
+            if snapshot is not None:
+                return snapshot, record
+            # record is None only when the endpoint does not exist (404):
+            # fall back to the ordinary Prometheus text exposition.
+
+        return await self._fetch_text(state)
+
+    async def _fetch_json_delta(
+        self, state: InstanceState, delta_url: str
+    ) -> tuple[HistogramSnapshot | None, ScrapeRecord | None]:
+        assert self._client is not None
+        params = (
+            {"since_seq": state.session.seq} if state.session is not None else None
+        )
+        response = await self._client.get(delta_url, params=params)
+        if response.status_code == 404:
+            # Plain Prometheus target without the incremental endpoint.
+            state.delta_capable = False
+            return None, None
+        response.raise_for_status()
+        body_bytes = len(response.content)
+        payload = response.json()  # raises ValueError on malformed JSON
+        scraped_at = time.time()
+
+        if payload.get("type") == "full":
+            snapshot, session = snapshot_from_full(
+                payload, self.metric_name, scraped_at
+            )
+            transport = TRANSPORT_FULL_JSON
+        elif payload.get("type") == "delta":
+            if state.session is None:
+                raise DeltaProtocolError(
+                    "delta payload received without an established session"
+                )
+            snapshot, session = apply_delta(
+                payload, state.session, self.metric_name, scraped_at
+            )
+            transport = TRANSPORT_DELTA_JSON
+        else:
+            raise DeltaProtocolError(
+                f"unknown delta payload type {payload.get('type')!r}"
+            )
+
+        # Only a fully validated response becomes the new baseline.
+        state.session = session
+        state.delta_capable = True
+        if transport == TRANSPORT_FULL_JSON:
+            state.full_body_bytes += body_bytes
+            state.full_responses += 1
+        else:
+            state.delta_body_bytes += body_bytes
+            state.delta_responses += 1
+        return snapshot, ScrapeRecord(
+            ok=True, at=scraped_at, snapshot=snapshot,
+            transport=transport, body_bytes=body_bytes,
+        )
+
+    async def _fetch_text(
+        self, state: InstanceState
+    ) -> tuple[HistogramSnapshot, ScrapeRecord]:
+        assert self._client is not None
+        response = await self._client.get(state.url)
+        response.raise_for_status()
+        body_bytes = len(response.content)
+        snapshot = parse_metrics_text(
+            response.text, self.metric_name, time.time()
+        )
+        state.full_body_bytes += body_bytes
+        state.full_responses += 1
+        return snapshot, ScrapeRecord(
+            ok=True, at=snapshot.scraped_at, snapshot=snapshot,
+            transport=TRANSPORT_TEXT, body_bytes=body_bytes,
+        )
 
     async def _scrape_loop(self) -> None:
         while True:
@@ -233,6 +367,7 @@ class ScrapeStore:
             last_ok = next(
                 (r for r in reversed(state.history) if r.ok), None
             )
+            session = state.session
             result["instances"][name] = {
                 "url": state.url,
                 "scrape_attempts": state.total_attempts,
@@ -246,8 +381,37 @@ class ScrapeStore:
                 "last_process_id": (
                     last_ok.snapshot.process_id if last_ok and last_ok.snapshot else None
                 ),
+                # Incremental-scraping telemetry.
+                "transport_mode": self._transport_mode(state),
+                "full_table_body_bytes": state.full_body_bytes,
+                "delta_body_bytes": state.delta_body_bytes,
+                "full_table_responses": state.full_responses,
+                "delta_responses": state.delta_responses,
+                "delta_session": (
+                    None
+                    if session is None
+                    else {
+                        "run_id": session.run_id,
+                        "seq": session.seq,
+                        "boundaries": session.boundaries,
+                        "exclusive_buckets": {
+                            str(k): v for k, v in session.exclusive.items()
+                        },
+                        "count": session.count,
+                        "sum": session.sum_value,
+                        "scrape_seq": session.scrape_seq,
+                    }
+                ),
             }
         return result
+
+    @staticmethod
+    def _transport_mode(state: InstanceState) -> str:
+        if state.delta_capable is False:
+            return "full-table-only"
+        if state.session is None:
+            return "unknown"
+        return "incremental-json"
 
 
 @asynccontextmanager
